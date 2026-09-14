@@ -3,89 +3,40 @@ from typing import Final
 
 import litellm
 from litellm import verbose_logger
-from litellm.types.llms.openai import (
-    ChatCompletionToolCallChunk,
-    ChatCompletionToolCallFunctionChunk,
-    ChatCompletionUsageBlock,
-)
-from litellm.types.utils import GenericStreamingChunk, Usage
+from litellm.types.utils import GenericStreamingChunk, ModelResponseStream
 
 
 class ModelResponseIterator:
     def __init__(self, streaming_response, sync_stream: bool):
         self.streaming_response = streaming_response
 
-    def chunk_parser(self, chunk: dict) -> GenericStreamingChunk:
+    @staticmethod
+    def _map_reasoning_to_reasoning_content(choices: list) -> list:
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta", {})
+            if isinstance(delta, dict) and "reasoning" in delta:
+                delta["reasoning_content"] = delta.pop("reasoning")
+        return choices
+
+    def chunk_parser(self, chunk: dict) -> ModelResponseStream:
         try:
-            processed_chunk: Final = litellm.ModelResponseStream(**chunk)
+            error: Final = chunk.get("error")
+            if error:
+                raise ValueError(f"Error in stream chunk: {error}")
 
-            text = ""
-            tool_use: ChatCompletionToolCallChunk | None = None
-            is_finished = False
-            finish_reason = ""
-            usage: ChatCompletionUsageBlock | None = None
-
-            # Usage-only final chunk (OpenAI ``stream_options.include_usage``)
-            # arrives with an empty ``choices`` list — return usage without
-            # indexing ``choices[0]``.
-            if len(processed_chunk.choices) == 0:
-                final_usage: Final = getattr(processed_chunk, "usage", None)
-                return GenericStreamingChunk(
-                    text="",
-                    tool_use=None,
-                    is_finished=False,
-                    finish_reason="",
-                    usage=(
-                        ChatCompletionUsageBlock(
-                            prompt_tokens=final_usage.prompt_tokens or 0,
-                            completion_tokens=final_usage.completion_tokens or 0,
-                            total_tokens=final_usage.total_tokens or 0,
-                        )
-                        if final_usage is not None
-                        else None
-                    ),
-                    index=0,
-                )
-
-            if processed_chunk.choices[0].delta.content is not None:
-                text = processed_chunk.choices[0].delta.content
-
-            if (
-                processed_chunk.choices[0].delta.tool_calls is not None
-                and len(processed_chunk.choices[0].delta.tool_calls) > 0
-                and processed_chunk.choices[0].delta.tool_calls[0].function is not None
-                and processed_chunk.choices[0].delta.tool_calls[0].function.arguments is not None
-            ):
-                tool_use = ChatCompletionToolCallChunk(
-                    id=processed_chunk.choices[0].delta.tool_calls[0].id,
-                    type="function",
-                    function=ChatCompletionToolCallFunctionChunk(
-                        name=processed_chunk.choices[0].delta.tool_calls[0].function.name,
-                        arguments=processed_chunk.choices[0].delta.tool_calls[0].function.arguments,
-                    ),
-                    index=processed_chunk.choices[0].delta.tool_calls[0].index,
-                )
-
-            if processed_chunk.choices[0].finish_reason is not None:
-                is_finished = True
-                finish_reason = processed_chunk.choices[0].finish_reason
-
-            usage_chunk: Final[Usage | None] = getattr(processed_chunk, "usage", None)
-            if usage_chunk is not None:
-                usage = ChatCompletionUsageBlock(
-                    prompt_tokens=usage_chunk.prompt_tokens,
-                    completion_tokens=usage_chunk.completion_tokens,
-                    total_tokens=usage_chunk.total_tokens,
-                )
-
-            return GenericStreamingChunk(
-                text=text,
-                tool_use=tool_use,
-                is_finished=is_finished,
-                finish_reason=finish_reason,
-                usage=usage,
-                index=0,
-            )
+            choices: Final = self._map_reasoning_to_reasoning_content(list(chunk.get("choices") or []))
+            kwargs: Final[dict] = {
+                "id": chunk.get("id"),
+                "object": "chat.completion.chunk",
+                "created": chunk.get("created"),
+                "model": chunk.get("model"),
+                "choices": choices,
+            }
+            if "usage" in chunk and chunk["usage"] is not None:
+                kwargs["usage"] = chunk["usage"]
+            return ModelResponseStream(**kwargs)
         except json.JSONDecodeError:
             raise ValueError(f"Failed to decode JSON from chunk: {chunk}")
 
